@@ -1,4 +1,4 @@
-#!/bin/bash                                                 # Указываем интерпретатор — Bash shell
+#!/bin/bash                                             
 
 set -e                                                      # Выход из скрипта при любой ошибке
 set -o pipefail                                             # Ошибки в конвейерах (pipes) тоже прерывают выполнение
@@ -91,7 +91,7 @@ check_requirements() {                                      # Объявлени
         systemctl start docker                              # Запуск службы Docker
     fi
     
-    # Проверяем наличие Docker Compose (как плагина)
+    # Проверяем наличие Docker Compose (как плагина, команда "docker compose")
     if ! docker compose version &> /dev/null; then          # Если плагин compose не установлен
         log_warn "Docker Compose не найден. Устанавливаем..." # Предупреждение
         apt-get update -qq                                  # Обновление списка пакетов
@@ -152,8 +152,21 @@ generate_config() {                                         # Объявлени
         log_info "Генерация ключей Reality..."              # Информационное сообщение
         # Запускаем контейнер Xray для генерации ключей x25519
         KEYS=$(docker run --rm ghcr.io/xtls/xray-core:latest x25519) # Генерация пары ключей
-        REALITY_PRIVATE_KEY=$(echo "$KEYS" | grep "Private key" | awk '{print $3}') # Извлечение приватного ключа
-        REALITY_PUBLIC_KEY=$(echo "$KEYS" | grep "Public key" | awk '{print $3}')   # Извлечение публичного ключа
+        
+        # ======================================================================
+        # ИСПРАВЛЕНИЕ: Парсинг вывода новой версии Xray
+        # Формат вывода:
+        # PrivateKey: <ключ>
+        # Password (PublicKey): <ключ>
+        # ======================================================================
+        REALITY_PRIVATE_KEY=$(echo "$KEYS" | grep "PrivateKey:" | awk '{print $2}')
+        REALITY_PUBLIC_KEY=$(echo "$KEYS" | grep "Password (PublicKey):" | awk '{print $3}')
+        
+        # Проверка, что ключи успешно сгенерированы
+        if [ -z "$REALITY_PRIVATE_KEY" ] || [ -z "$REALITY_PUBLIC_KEY" ]; then
+            log_error "Не удалось сгенерировать ключи Reality. Проверьте вывод Docker."
+        fi
+        
         export REALITY_PRIVATE_KEY                          # Экспорт приватного ключа
         export REALITY_PUBLIC_KEY                           # Экспорт публичного ключа
         log_info "✓ Ключи Reality сгенерированы"            # Сообщение об успехе
@@ -321,9 +334,6 @@ setup_ssh_keys() {                                          # Объявлени
         echo "PasswordAuthentication no" >> "$SSHD_CONFIG"  # Добавляем строку, если её нет
     fi
     
-    # Запрещаем вход под root (опционально, если есть другой пользователь)
-    # sed -i 's/^PermitRootLogin yes/PermitRootLogin no/' "$SSHD_CONFIG"
-    
     # Перезапускаем SSH для применения изменений
     systemctl restart ssh                                   # Перезапуск службы SSH
     log_info "✓ SSH настроен и перезапущен"                 # Сообщение об успехе
@@ -340,7 +350,7 @@ install_fail2ban() {                                        # Объявлени
     apt-get install -y fail2ban                             # Установка Fail2Ban
     
     # Создание основного конфигурационного файла
-    cat > /etc/fail2ban/jail.local << 'EOF'                 # Начало heredoc для jail.local
+    cat > /etc/fail2ban/jail.local << EOF                   # Начало heredoc для jail.local
 [DEFAULT]                                                   # Секция настроек по умолчанию
 bantime = 86400                                             # Время бана — 24 часа (в секундах)
 findtime = 600                                              # Период поиска — 10 минут
@@ -428,7 +438,7 @@ show_info() {                                               # Объявлени
     
     # Информация о панели 3X-UI
     log_info "📊 ПАНЕЛЬ 3X-UI:"                             # Заголовок секции
-    echo "  URL: https://${SERVER_IP}:${PANEL_PORT}${PANEL_PATH}" # Полный URL панели
+    echo "  URL: http://${SERVER_IP}:${PANEL_PORT}${PANEL_PATH}" # Полный URL панели
     echo "  Логин: ${PANEL_USERNAME}"                       # Имя пользователя
     echo "  Пароль: ${PANEL_PASSWORD}"                      # Пароль
     echo ""                                                 # Пустая строка
@@ -459,8 +469,6 @@ show_info() {                                               # Объявлени
     echo "  docker compose logs -f         # Просмотр логов"     # Команда 2
     echo "  docker compose restart         # Перезапуск"         # Команда 3
     echo "  docker compose down            # Остановка"          # Команда 4
-    echo "  ./scripts/backup.sh            # Резервная копия"    # Команда 5
-    echo "  ./scripts/update.sh            # Обновление"         # Команда 6
     echo ""                                                 # Пустая строка
     
     log_info "============================================================" # Разделитель
