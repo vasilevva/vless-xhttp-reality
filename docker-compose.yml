@@ -1,0 +1,120 @@
+version: '3.8'                                              # Версия синтаксиса Docker Compose
+
+services:                                                   # Блок описания всех сервисов
+  
+  # ============================================
+  # 3X-UI - Панель управления с усиленной защитой
+  # ============================================
+  3x-ui:                                                    # Идентификатор сервиса
+    image: ghcr.io/mhsanaei/3x-ui:latest                   # Образ панели 3X-UI последней версии
+    container_name: 3x-ui                                   # Фиксированное имя контейнера
+    restart: unless-stopped                                 # Автоперезапуск при сбое или перезагрузке
+    network_mode: host                                      # Используем сеть хоста для производительности
+    volumes:                                                # Блок монтирования томов
+      - ./data/3x-ui:/etc/x-ui                             # База данных и конфигурация панели
+      - ./data/cert:/root/cert                             # SSL/TLS сертификаты
+      - ./data/logs:/var/log/xray                          # Логи работы Xray
+      - /etc/timezone:/etc/timezone:ro                     # Часовая зона (только чтение)
+      - /etc/localtime:/etc/localtime:ro                   # Локальное время (только чтение)
+    environment:                                            # Переменные окружения контейнера
+      XUI_ENABLE_FAIL2BAN: "true"                          # Активируем встроенную защиту Fail2Ban
+      XUI_FAIL2BAN_MAX_RETRY: 3                            # Бан после 3 неудачных попыток входа
+      XUI_FAIL2BAN_FINDTIME: 600                           # Период подсчёта попыток — 10 минут
+      XUI_FAIL2BAN_BANTIME: 86400                          # Время бана — 24 часа
+      XUI_SUB_PATH: "${PANEL_PATH}"                        # Сложный путь к панели из .env
+    cap_add:                                                # Дополнительные возможности ядра
+      - NET_ADMIN                                          # Управление сетевыми интерфейсами
+      - NET_RAW                                            # Доступ к raw-сокетам
+    sysctls:                                                # Настройки ядра
+      - net.ipv4.ip_forward=1                              # Разрешаем пересылку IP-пакетов
+    healthcheck:                                            # Проверка работоспособности
+      test: ["CMD", "curl", "-f", "http://localhost:${PANEL_PORT}${PANEL_PATH}"] # Команда проверки
+      interval: 30s                                         # Интервал между проверками
+      timeout: 10s                                          # Таймаут ожидания ответа
+      retries: 3                                            # Количество попыток до признания нездоровым
+      start_period: 40s                                     # Время на запуск перед проверками
+
+  # ============================================
+  # Xray Core - Основной прокси-сервер
+  # ============================================
+  xray:                                                     # Идентификатор сервиса
+    image: ghcr.io/xtls/xray-core:latest                   # Образ Xray последней версии
+    container_name: xray                                    # Фиксированное имя контейнера
+    restart: unless-stopped                                 # Автоперезапуск при сбое
+    network_mode: host                                      # Сеть хоста для прямого доступа к портам
+    volumes:                                                # Блок монтирования томов
+      - ./data/xray:/etc/xray                              # Конфигурация Xray
+      - ./data/cert:/root/cert                             # SSL сертификаты
+      - ./data/logs:/var/log/xray                          # Логи работы
+    cap_add:                                                # Дополнительные возможности
+      - NET_ADMIN                                          # Управление сетью
+      - NET_RAW                                            # Raw-сокеты
+    sysctls:                                                # Настройки ядра
+      - net.ipv4.ip_forward=1                              # Разрешение пересылки пакетов
+    environment:                                            # Переменные окружения
+      - LOG_LEVEL=warning                                  # Уровень логирования — только предупреждения и выше
+    depends_on:                                             # Зависимости запуска
+      - 3x-ui                                              # Запускать после 3X-UI
+    healthcheck:                                            # Проверка здоровья
+      test: ["CMD", "xray", "run", "-test", "-c", "/etc/xray/config.json"] # Проверка конфига
+      interval: 60s                                         # Проверка каждую минуту
+      timeout: 5s                                           # Таймаут 5 секунд
+      retries: 3                                            # 3 попытки
+
+  # ============================================
+  # Nginx - Reverse proxy для скрытия панели
+  # ============================================
+  nginx:                                                    # Идентификатор сервиса
+    image: nginx:alpine                                     # Лёгкий образ Nginx на Alpine Linux
+    container_name: nginx-proxy                             # Имя контейнера
+    restart: unless-stopped                                 # Автоперезапуск
+    network_mode: host                                      # Сеть хоста (нужно для 443 порта)
+    volumes:                                                # Монтирование томов
+      - ./config/nginx/nginx.conf:/etc/nginx/nginx.conf:ro # Конфигурация Nginx (только чтение)
+      - ./data/cert:/etc/nginx/cert:ro                     # SSL сертификаты (только чтение)
+      - ./data/logs/nginx:/var/log/nginx                   # Логи доступа Nginx
+    depends_on:                                             # Зависимости
+      - 3x-ui                                              # Запускать после панели
+    profiles:                                               # Профили запуска
+      - with-nginx                                         # Запускается только с этим профилем
+    healthcheck:                                            # Проверка здоровья
+      test: ["CMD", "curl", "-f", "http://localhost/health"] # Проверка эндпоинта здоровья
+      interval: 30s                                         # Каждые 30 секунд
+      timeout: 5s                                           # Таймаут 5 секунд
+      retries: 3                                            # 3 попытки
+
+  # ============================================
+  # Watchtower - Автоматическое обновление
+  # ============================================
+  watchtower:                                               # Идентификатор сервиса
+    image: containrrr/watchtower                           # Образ Watchtower
+    container_name: watchtower                              # Имя контейнера
+    restart: unless-stopped                                 # Автоперезапуск
+    volumes:                                                # Монтирование томов
+      - /var/run/docker.sock:/var/run/docker.sock          # Доступ к Docker API для управления
+    command: --cleanup --interval 604800 3x-ui xray nginx  # Команда: чистка, проверка раз в неделю
+    environment:                                            # Переменные окружения
+      - WATCHTOWER_NOTIFICATIONS=auto                      # Уведомления об обновлениях
+    profiles:                                               # Профили
+      - auto-update                                        # Опциональный запуск
+
+  # ============================================
+  # Portainer - Управление Docker (СКРЫТ)
+  # ============================================
+  portainer:                                                # Идентификатор сервиса
+    image: portainer/portainer-ce:latest                   # Образ Portainer Community Edition
+    container_name: portainer                               # Имя контейнера
+    restart: unless-stopped                                 # Автоперезапуск
+    ports:                                                  # ВАЖНО: НЕ публикуем порт наружу!
+      - "127.0.0.1:9000:9000"                              # Слушаем ТОЛЬКО на localhost
+    volumes:                                                # Монтирование томов
+      - ./data/portainer:/data                             # Данные Portainer
+      - /var/run/docker.sock:/var/run/docker.sock          # Docker API
+    command: --admin-password '${PORTAINER_HASHED_PASSWORD}' # Хэшированный пароль админа
+    profiles:                                               # Профили
+      - management                                         # Опциональный запуск
+    healthcheck:                                            # Проверка здоровья
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9000"] # Проверка доступности
+      interval: 30s                                         # Каждые 30 секунд
+      timeout: 5s                                           # Таймаут
+      retries: 3                                            # 3 попытки
