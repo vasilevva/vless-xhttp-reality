@@ -1,542 +1,61 @@
-#!/bin/bash                                             
+services:
+  # ============================================
+  # 3X-UI - Панель управления (Включает в себя Xray)
+  # ============================================
+  3x-ui:
+    image: ghcr.io/mhsanaei/3x-ui:latest
+    container_name: 3x-ui
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./data/3x-ui:/etc/x-ui
+      - ./data/cert:/root/cert
+      - ./data/logs:/var/log/xray
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      XUI_ENABLE_FAIL2BAN: "true"
+      XUI_FAIL2BAN_MAX_RETRY: 3
+      XUI_FAIL2BAN_FINDTIME: 600
+      XUI_FAIL2BAN_BANTIME: 86400
+      XUI_SUB_PATH: "${PANEL_PATH}"
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${PANEL_PORT}${PANEL_PATH}panel/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
 
-set -e                                                      # Выход из скрипта при любой ошибке
-set -o pipefail                                             # Ошибки в конвейерах (pipes) тоже прерывают выполнение
+  # ============================================
+  # Watchtower - Автоматическое обновление
+  # ============================================
+  watchtower:
+    image: containrrr/watchtower
+    container_name: watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: --cleanup --interval 604800 3x-ui
+    environment:
+      - WATCHTOWER_NOTIFICATIONS=auto
+    profiles:
+      - auto-update
 
-# ==============================================================================
-# ЦВЕТОВОЕ ОФОРМЛЕНИЕ ВЫВОДА
-# ==============================================================================
-RED='\033[0;31m'                                            # Красный цвет для ошибок
-GREEN='\033[0;32m'                                          # Зелёный цвет для успешных сообщений
-YELLOW='\033[1;33m'                                         # Жёлтый цвет для предупреждений
-BLUE='\033[0;34m'                                           # Синий цвет для информации
-NC='\033[0m'                                                # Сброс цвета (No Color)
-
-# ==============================================================================
-# ФУНКЦИИ ЛОГИРОВАНИЯ
-# ==============================================================================
-
-# Функция вывода информационного сообщения
-log_info() {                                                # Объявление функции log_info
-    echo -e "${GREEN}[INFO]${NC} $1"                        # Вывод зелёного тега [INFO] и текста сообщения
-}
-
-# Функция вывода предупреждения
-log_warn() {                                                # Объявление функции log_warn
-    echo -e "${YELLOW}[WARN]${NC} $1"                       # Вывод жёлтого тега [WARN] и текста предупреждения
-}
-
-# Функция вывода ошибки с завершением скрипта
-log_error() {                                               # Объявление функции log_error
-    echo -e "${RED}[ERROR]${NC} $1"                         # Вывод красного тега [ERROR] и текста ошибки
-    exit 1                                                  # Завершение скрипта с кодом ошибки 1
-}
-
-# Функция вывода отладочной информации
-log_debug() {                                               # Объявление функции log_debug
-    echo -e "${BLUE}[DEBUG]${NC} $1"                        # Вывод синего тега [DEBUG] и текста
-}
-
-# ==============================================================================
-# ФУНКЦИЯ: ГЕНЕРАЦИЯ СЛУЧАЙНОГО БЕЗОПАСНОГО ПАРОЛЯ
-# ==============================================================================
-generate_secure_password() {                                # Объявление функции генерации пароля
-    local length=${1:-32}                                   # Длина пароля (по умолчанию 32 символа)
-    openssl rand -base64 48 | tr -dc 'A-Za-z0-9!@#$%^&*' | head -c "$length" # Генерация случайной строки
-}
-
-# ==============================================================================
-# ФУНКЦИЯ: ГЕНЕРАЦИЯ СЛУЧАЙНОГО ПУТИ ДЛЯ ПАНЕЛИ
-# ==============================================================================
-generate_random_path() {                                    # Объявление функции генерации пути
-    local part1=$(openssl rand -hex 4)                      # Первая часть пути — 8 hex-символов
-    local part2=$(openssl rand -hex 4)                      # Вторая часть пути — 8 hex-символов
-    echo "/${part1}${part2}/"                               # Возвращаем путь формата /xxxxxxxxxxxxxxxx/
-}
-
-# ==============================================================================
-# ФУНКЦИЯ: ГЕНЕРАЦИЯ СЛУЧАЙНОГО ПОРТА
-# ==============================================================================
-generate_random_port() {                                    # Объявление функции генерации порта
-    shuf -i 10000-65000 -n 1                                # Случайное число в диапазоне 10000-65000
-}
-
-# ==============================================================================
-# ФУНКЦИЯ: СОЗДАНИЕ ХЭША ПАРОЛЯ ДЛЯ PORTAINER
-# ==============================================================================
-create_portainer_password_hash() {                          # Объявление функции хэширования
-    local password=$1                                       # Получаем пароль как первый аргумент
-    # Используем htpasswd для создания bcrypt-хэша (требует apache2-utils)
-    htpasswd -nbB admin "$password" | cut -d ":" -f 2      # Генерация хэша и извлечение только хэша
-}
-
-# ==============================================================================
-# ФУНКЦИЯ: ПРОВЕРКА СИСТЕМНЫХ ТРЕБОВАНИЙ
-# ==============================================================================
-check_requirements() {                                      # Объявление функции проверки
-    log_info "Проверка системных требований..."             # Информационное сообщение
-    
-    # Проверяем наличие curl
-    if ! command -v curl &> /dev/null; then                 # Если curl не установлен
-        log_warn "curl не найден. Устанавливаем..."         # Предупреждение
-        apt-get update -qq                                  # Обновление списка пакетов (тихо)
-        apt-get install -y curl                             # Установка curl
-    fi
-    
-    # Проверяем наличие Docker
-    if ! command -v docker &> /dev/null; then               # Если Docker не установлен
-        log_warn "Docker не найден. Устанавливаем..."       # Предупреждение
-        curl -fsSL https://get.docker.com | sh              # Загрузка и запуск установщика Docker
-        systemctl enable docker                             # Добавление Docker в автозагрузку
-        systemctl start docker                              # Запуск службы Docker
-    fi
-    
-    # Проверяем наличие Docker Compose (как плагина, команда "docker compose")
-    if ! docker compose version &> /dev/null; then          # Если плагин compose не установлен
-        log_warn "Docker Compose не найден. Устанавливаем..." # Предупреждение
-        apt-get update -qq                                  # Обновление списка пакетов
-        apt-get install -y docker-compose-plugin            # Установка плагина Docker Compose
-    fi
-    
-    # Проверяем наличие openssl
-    if ! command -v openssl &> /dev/null; then              # Если openssl не установлен
-        log_warn "openssl не найден. Устанавливаем..."      # Предупреждение
-        apt-get install -y openssl                          # Установка openssl
-    fi
-    
-    # Проверяем наличие apache2-utils (для htpasswd)
-    if ! command -v htpasswd &> /dev/null; then             # Если htpasswd не установлен
-        log_warn "apache2-utils не найден. Устанавливаем..." # Предупреждение
-        apt-get install -y apache2-utils                    # Установка пакета с htpasswd
-    fi
-    
-    # Проверяем права root
-    if [ "$EUID" -ne 0 ]; then                              # Если текущий пользователь не root
-        log_error "Скрипт должен быть запущен с правами root (sudo)" # Ошибка и выход
-    fi
-    
-    log_info "✓ Все требования выполнены"                   # Сообщение об успехе
-}
-
-# ==============================================================================
-# ФУНКЦИЯ: ГЕНЕРАЦИЯ КОНФИГУРАЦИИ
-# ==============================================================================
-generate_config() {                                         # Объявление функции генерации конфига
-    log_info "Генерация конфигурации..."                    # Информационное сообщение
-    
-    # Создание структуры директорий
-    log_debug "Создание директорий..."                      # Отладочное сообщение
-    mkdir -p data/{3x-ui,xray,cert,logs/nginx,portainer}    # Создание всех необходимых папок
-    mkdir -p config/{xray,nginx}                            # Создание папок для конфигов
-    mkdir -p backups                                        # Папка для резервных копий
-    
-    # Установка прав доступа
-    chmod 700 data                                          # Владелец имеет полный доступ к data
-    chmod 600 data/cert                                     # Сертификаты доступны только владельцу
-    
-    # Загрузка переменных из .env если он существует
-    if [ -f .env ]; then                                    # Если файл .env существует
-        log_debug "Загрузка существующих переменных из .env" # Отладочное сообщение
-        source .env                                         # Загружаем переменные в текущую оболочку
-    fi
-    
-    # Генерация UUID если не задан
-    if [ -z "$UUID" ]; then                                 # Если UUID пустой или не определён
-        UUID=$(cat /proc/sys/kernel/random/uuid)            # Генерация случайного UUID из ядра
-        export UUID                                         # Экспорт в окружение
-        log_info "Сгенерирован UUID: $UUID"                 # Информационное сообщение
-    fi
-    
-    # Генерация ключей Reality если не заданы
-    if [ -z "$REALITY_PRIVATE_KEY" ]; then                  # Если приватный ключ не задан
-        log_info "Генерация ключей Reality..."              # Информационное сообщение
-        # Запускаем контейнер Xray для генерации ключей x25519
-        KEYS=$(docker run --rm ghcr.io/xtls/xray-core:latest x25519) # Генерация пары ключей
-        
-        # ======================================================================
-        # ИСПРАВЛЕНИЕ: Парсинг вывода новой версии Xray
-        # Формат вывода:
-        # PrivateKey: <ключ>
-        # Password (PublicKey): <ключ>
-        # ======================================================================
-        REALITY_PRIVATE_KEY=$(echo "$KEYS" | grep "PrivateKey:" | awk '{print $2}')
-        REALITY_PUBLIC_KEY=$(echo "$KEYS" | grep "Password (PublicKey):" | awk '{print $3}')
-        
-        # Проверка, что ключи успешно сгенерированы
-        if [ -z "$REALITY_PRIVATE_KEY" ] || [ -z "$REALITY_PUBLIC_KEY" ]; then
-            log_error "Не удалось сгенерировать ключи Reality. Проверьте вывод Docker."
-        fi
-        
-        export REALITY_PRIVATE_KEY                          # Экспорт приватного ключа
-        export REALITY_PUBLIC_KEY                           # Экспорт публичного ключа
-        log_info "✓ Ключи Reality сгенерированы"            # Сообщение об успехе
-    fi
-    
-    # Генерация Short ID если не задан
-    if [ -z "$REALITY_SHORT_ID" ]; then                     # Если Short ID не задан
-        REALITY_SHORT_ID=$(openssl rand -hex 8)             # Генерация 8 байт в hex-формате (16 символов)
-        export REALITY_SHORT_ID                             # Экспорт в окружение
-        log_info "Сгенерирован Short ID: $REALITY_SHORT_ID" # Информационное сообщение
-    fi
-    
-    # Генерация случайного порта для панели если не задан
-    if [ -z "$PANEL_PORT" ] || [ "$PANEL_PORT" = "58492" ]; then # Если порт стандартный или не задан
-        PANEL_PORT=$(generate_random_port)                  # Генерация случайного порта
-        export PANEL_PORT                                   # Экспорт порта
-        log_info "Сгенерирован случайный порт панели: $PANEL_PORT" # Информационное сообщение
-    fi
-    
-    # Генерация сложного пути для панели если не задан
-    if [ -z "$PANEL_PATH" ] || [ "$PANEL_PATH" = "/x7k9m2p4q8w1n5b3/" ]; then # Если путь стандартный
-        PANEL_PATH=$(generate_random_path)                  # Генерация случайного пути
-        export PANEL_PATH                                   # Экспорт пути
-        log_info "Сгенерирован скрытый путь панели: $PANEL_PATH" # Информационное сообщение
-    fi
-    
-    # Генерация безопасного пароля если используется стандартный
-    if [ "$PANEL_PASSWORD" = "Kx9#mP2\$vL5nQ8@wR4" ] || [ -z "$PANEL_PASSWORD" ]; then # Если пароль стандартный
-        PANEL_PASSWORD=$(generate_secure_password 24)       # Генерация случайного пароля длиной 24 символа
-        export PANEL_PASSWORD                               # Экспорт пароля
-        log_info "Сгенерирован безопасный пароль панели"    # Информационное сообщение
-    fi
-    
-    # Генерация хэша пароля для Portainer
-    if [ -z "$PORTAINER_HASHED_PASSWORD" ]; then            # Если хэш не создан
-        log_info "Создание хэша пароля Portainer..."        # Информационное сообщение
-        PORTAINER_HASHED_PASSWORD=$(create_portainer_password_hash "${PORTAINER_PASSWORD:-admin123}") # Хэширование
-        export PORTAINER_HASHED_PASSWORD                    # Экспорт хэша
-        log_info "✓ Хэш пароля Portainer создан"            # Сообщение об успехе
-    fi
-    
-    # Создание файла .env с переменными
-    log_debug "Сохранение конфигурации в .env..."           # Отладочное сообщение
-    cat > .env << EOF                                       # Начало heredoc для записи в .env
-# ==============================================================================
-# АВТОМАТИЧЕСКИ СГЕНЕРИРОВАННАЯ КОНФИГУРАЦИЯ
-# Дата генерации: $(date '+%Y-%m-%d %H:%M:%S')
-# ==============================================================================
-
-# Имя проекта Docker Compose
-COMPOSE_PROJECT_NAME=vless-reality
-
-# Настройки панели 3X-UI (УСИЛЕННАЯ БЕЗОПАСНОСТЬ)
-PANEL_PORT=${PANEL_PORT}
-PANEL_PATH=${PANEL_PATH}
-PANEL_USERNAME=${PANEL_USERNAME:-superadmin_x9k2}
-PANEL_PASSWORD=${PANEL_PASSWORD}
-
-# Настройки Xray
-XRAY_LOG_LEVEL=warning
-VLESS_PORT=443
-UUID=${UUID}
-
-# Настройки Reality
-REALITY_DEST=www.microsoft.com:443
-REALITY_SNI=www.microsoft.com
-REALITY_PRIVATE_KEY=${REALITY_PRIVATE_KEY}
-REALITY_PUBLIC_KEY=${REALITY_PUBLIC_KEY}
-REALITY_SHORT_ID=${REALITY_SHORT_ID}
-
-# Безопасность
-FAIL2BAN_ENABLED=true
-FAIL2BAN_MAX_RETRY=3
-FAIL2BAN_BANTIME=86400
-FAIL2BAN_FINDTIME=600
-
-# Portainer (СКРЫТЫЙ ДОСТУП)
-PORTAINER_PORT=9000
-PORTAINER_USERNAME=${PORTAINER_USERNAME:-admin}
-PORTAINER_HASHED_PASSWORD=${PORTAINER_HASHED_PASSWORD}
-
-# Системные настройки
-TZ=Europe/Moscow
-EOF
-    
-    # Защита файла .env от чтения другими пользователями
-    chmod 600 .env                                          # Только владелец может читать/писать .env
-    log_info "✓ Конфигурация сохранена в .env (права: 600)" # Информационное сообщение
-}
-
-# ==============================================================================
-# ФУНКЦИЯ: ВКЛЮЧЕНИЕ IP-ФОРВАРДИНГА НА УРОВНЕ ХОСТА
-# ==============================================================================
-setup_ip_forwarding() {                                     # Объявление функции настройки IP-форвардинга
-    log_info "Настройка IP-форвардинга на уровне хоста..."  # Информационное сообщение
-    
-    # Проверяем текущее состояние параметра
-    CURRENT_VALUE=$(sysctl -n net.ipv4.ip_forward)          # Читаем текущее значение
-    
-    if [ "$CURRENT_VALUE" = "1" ]; then                     # Если уже включено
-        log_info "✓ IP-форвардинг уже включён"              # Сообщение об успехе
-    else
-        log_info "Включение IP-форвардинга..."              # Информационное сообщение
-        # Включаем IP-форвардинг прямо сейчас (применяется немедленно)
-        sysctl -w net.ipv4.ip_forward=1                     # Установка значения 1
-        log_info "✓ IP-форвардинг включён (текущая сессия)" # Сообщение об успехе
-    fi
-    
-    # Проверяем, есть ли уже запись в /etc/sysctl.conf
-    if grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf; then # Если запись уже есть
-        log_info "✓ Настройка уже сохранена в /etc/sysctl.conf" # Сообщение
-    else
-        log_info "Сохранение настройки в /etc/sysctl.conf..." # Информационное сообщение
-        # Добавляем запись в sysctl.conf для сохранения после перезагрузки
-        echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf    # Дописываем в конфиг
-        log_info "✓ Настройка сохранена (сохранится после перезагрузки)" # Сообщение об успехе
-    fi
-    
-    # Применяем все настройки из sysctl.conf (на случай, если есть другие параметры)
-    sysctl -p > /dev/null 2>&1                              # Перечитываем sysctl.conf тихо
-    
-    # Финальная проверка
-    FINAL_VALUE=$(sysctl -n net.ipv4.ip_forward)            # Читаем итоговое значение
-    if [ "$FINAL_VALUE" = "1" ]; then                       # Если значение равно 1
-        log_info "✓ IP-форвардинг успешно настроен"         # Сообщение об успехе
-    else
-        log_error "Не удалось включить IP-форвардинг"       # Ошибка и выход
-    fi
-}
-
-# ==============================================================================
-# ФУНКЦИЯ: НАСТРОЙКА FIREWALL (UFW)
-# ==============================================================================
-setup_firewall() {                                          # Объявление функции настройки firewall
-    log_info "Настройка firewall (UFW)..."                  # Информационное сообщение
-    
-    # Проверяем наличие UFW
-    if command -v ufw &> /dev/null; then                    # Если UFW установлен
-        ufw --force enable                                  # Включаем UFW без подтверждения
-        ufw default deny incoming                           # Запрещаем все входящие по умолчанию
-        ufw default allow outgoing                          # Разрешаем все исходящие по умолчанию
-        
-        # Разрешаем SSH (порт 22 или текущий)
-        ufw allow 22/tcp comment 'SSH access'               # Разрешаем SSH с комментарием
-        
-        # Разрешаем HTTP/HTTPS для Let's Encrypt и веб-трафика
-        ufw allow 80/tcp comment 'HTTP for certbot'         # Порт 80 для проверки домена
-        ufw allow 443/tcp comment 'HTTPS/VLESS traffic'     # Порт 443 для VLESS и HTTPS
-        
-        # Разрешаем порт панели (случайный)
-        ufw allow ${PANEL_PORT}/tcp comment '3X-UI panel'   # Порт панели с комментарием
-        
-        # Перезагружаем правила
-        ufw reload                                          # Применение изменений
-        
-        log_info "✓ Firewall настроен"                      # Сообщение об успехе
-        log_warn "Открытые порты:"                          # Предупреждение со списком
-        echo "  - 22/tcp (SSH)"                             # Порт SSH
-        echo "  - 80/tcp (HTTP)"                            # Порт HTTP
-        echo "  - 443/tcp (HTTPS/VLESS)"                    # Порт HTTPS
-        echo "  - ${PANEL_PORT}/tcp (Panel)"                # Порт панели
-    else
-        log_warn "UFW не найден. Пропускаем настройку firewall" # Предупреждение
-    fi
-}
-
-# ==============================================================================
-# ФУНКЦИЯ: НАСТРОЙКА SSH-КЛЮЧЕЙ
-# ==============================================================================
-setup_ssh_keys() {                                          # Объявление функции настройки SSH
-    log_info "Настройка SSH-аутентификации по ключам..."    # Информационное сообщение
-    
-    # Создаём директорию .ssh если её нет
-    if [ ! -d /root/.ssh ]; then                            # Если директории .ssh не существует
-        mkdir -p /root/.ssh                                 # Создаём директорию
-        chmod 700 /root/.ssh                                # Устанавливаем безопасные права (только владелец)
-    fi
-    
-    # Создаём файл authorized_keys если его нет
-    if [ ! -f /root/.ssh/authorized_keys ]; then            # Если файл не существует
-        touch /root/.ssh/authorized_keys                    # Создаём пустой файл
-        chmod 600 /root/.ssh/authorized_keys                # Права: только владелец может читать/писать
-    fi
-    
-    # Проверяем, есть ли уже ключи
-    if [ ! -s /root/.ssh/authorized_keys ]; then            # Если файл пустой
-        log_warn "ВАЖНО: Добавьте свой SSH-публичный ключ!" # Предупреждение
-        log_warn "Команда: nano /root/.ssh/authorized_keys" # Подсказка
-        log_warn "Или: ssh-copy-id root@ВАШ_IP"             # Альтернативная подсказка
-    fi
-    
-    # Настройка sshd_config для безопасности
-    SSHD_CONFIG="/etc/ssh/sshd_config"                      # Путь к конфигу SSH
-    
-    # Создаём резервную копию перед изменением
-    cp "$SSHD_CONFIG" "${SSHD_CONFIG}.backup.$(date +%s)"   # Бэкап с временной меткой
-    
-    # Отключаем вход по паролю (только ключи)
-    if grep -q "^PasswordAuthentication yes" "$SSHD_CONFIG"; then # Если парольная аутентификация включена
-        sed -i 's/^PasswordAuthentication yes/PasswordAuthentication no/' "$SSHD_CONFIG" # Отключаем
-        log_info "✓ Парольная аутентификация SSH отключена" # Сообщение об успехе
-    elif grep -q "^#PasswordAuthentication" "$SSHD_CONFIG"; then # Если закомментировано
-        sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication no/' "$SSHD_CONFIG" # Раскомментируем и отключаем
-    else
-        echo "PasswordAuthentication no" >> "$SSHD_CONFIG"  # Добавляем строку, если её нет
-    fi
-    
-    # Перезапускаем SSH для применения изменений
-    systemctl restart ssh                                   # Перезапуск службы SSH
-    log_info "✓ SSH настроен и перезапущен"                 # Сообщение об успехе
-}
-
-# ==============================================================================
-# ФУНКЦИЯ: УСТАНОВКА И НАСТРОЙКА FAIL2BAN
-# ==============================================================================
-install_fail2ban() {                                        # Объявление функции установки Fail2Ban
-    log_info "Установка Fail2Ban..."                        # Информационное сообщение
-    
-    # Установка Fail2Ban
-    apt-get update -qq                                      # Обновление списка пакетов (тихо)
-    apt-get install -y fail2ban                             # Установка Fail2Ban
-    
-    # Создание основного конфигурационного файла
-    cat > /etc/fail2ban/jail.local << EOF                   # Начало heredoc для jail.local
-[DEFAULT]                                                   # Секция настроек по умолчанию
-bantime = 86400                                             # Время бана — 24 часа (в секундах)
-findtime = 600                                              # Период поиска — 10 минут
-maxretry = 3                                                # Максимум попыток перед баном
-backend = auto                                              # Автоматический выбор backend для чтения логов
-banaction = iptables-multiport                              # Действие — блокировка через iptables
-
-[sshd]                                                      # Защита SSH
-enabled = true                                              # Включить защиту SSH
-port = ssh                                                  # Порт SSH (стандартный или из конфига)
-filter = sshd                                               # Использовать стандартный фильтр sshd
-logpath = /var/log/auth.log                                 # Путь к логу аутентификации
-maxretry = 3                                                # 3 попытки = бан
-bantime = 86400                                             # Бан на 24 часа
-
-[3x-ui]                                                     # Защита панели 3X-UI
-enabled = true                                              # Включить защиту
-port = ${PANEL_PORT}                                        # Порт панели (подставится из переменной)
-filter = 3x-ui                                              # Наш кастомный фильтр
-logpath = /var/log/xray/*.log                               # Логи Xray
-maxretry = 5                                                # 5 попыток = бан
-bantime = 86400                                             # Бан на 24 часа
-
-[nginx-http-auth]                                           # Защита Nginx HTTP auth
-enabled = true                                              # Включить
-port = http,https                                           # Порты HTTP и HTTPS
-filter = nginx-http-auth                                    # Стандартный фильтр
-logpath = /var/log/nginx/error.log                          # Логи ошибок Nginx
-maxretry = 3                                                # 3 попытки = бан
-EOF
-    
-    # Создание кастомного фильтра для 3X-UI
-    cat > /etc/fail2ban/filter.d/3x-ui.conf << 'EOF'        # Начало heredoc для фильтра
-[Definition]                                                # Секция определения
-failregex = ^.*Failed login attempt.*$                      # Неудачная попытка входа
-            ^.*Invalid user.*$                              # Неверное имя пользователя
-            ^.*Authentication failed.*$                     # Ошибка аутентификации
-            ^.*Unauthorized access.*$                       # Неавторизованный доступ
-ignoreregex =                                               # Игнорируемые паттерны (пусто)
-EOF
-    
-    # Включение и запуск Fail2Ban
-    systemctl enable fail2ban                               # Добавление в автозагрузку
-    systemctl restart fail2ban                              # Перезапуск службы
-    log_info "✓ Fail2Ban установлен и настроен"             # Сообщение об успехе
-}
-
-# ==============================================================================
-# ФУНКЦИЯ: ЗАПУСК СЕРВИСОВ
-# ==============================================================================
-start_services() {                                          # Объявление функции запуска
-    log_info "Запуск сервисов Docker..."                    # Информационное сообщение
-    
-    # Остановка существующих контейнеров если есть
-    docker compose down 2>/dev/null || true                 # Остановка (игнорируем ошибки если нет контейнеров)
-    
-    # Запуск всех сервисов в фоне
-    docker compose up -d                                    # Запуск в detached mode (фон)
-    
-    # Ожидание запуска сервисов
-    log_info "Ожидание запуска сервисов..."                 # Информационное сообщение
-    sleep 15                                                # Пауза 15 секунд на инициализацию
-    
-    # Проверка статуса контейнеров
-    if docker compose ps | grep -q "Up"; then               # Если есть работающие контейнеры
-        log_info "✓ Сервисы запущены успешно!"              # Сообщение об успехе
-        docker compose ps                                   # Вывод статуса контейнеров
-    else
-        log_error "Не удалось запустить сервисы"            # Ошибка и выход
-    fi
-}
-
-# ==============================================================================
-# ФУНКЦИЯ: ВЫВОД ИНФОРМАЦИИ ПОСЛЕ УСТАНОВКИ
-# ==============================================================================
-show_info() {                                               # Объявление функции вывода информации
-    echo ""                                                 # Пустая строка для разделения
-    log_info "============================================================" # Разделитель
-    log_info "✓ УСТАНОВКА ЗАВЕРШЕНА УСПЕШНО!"               # Сообщение об успехе
-    log_info "============================================================" # Разделитель
-    echo ""                                                 # Пустая строка
-    
-    # Получение публичного IP сервера
-    SERVER_IP=$(curl -s ifconfig.me || echo "ВАШ_IP")       # Определение внешнего IP
-    
-    # Информация о панели 3X-UI
-    log_info "📊 ПАНЕЛЬ 3X-UI:"                             # Заголовок секции
-    echo "  URL: http://${SERVER_IP}:${PANEL_PORT}${PANEL_PATH}" # Полный URL панели
-    echo "  Логин: ${PANEL_USERNAME}"                       # Имя пользователя
-    echo "  Пароль: ${PANEL_PASSWORD}"                      # Пароль
-    echo ""                                                 # Пустая строка
-    
-    # Предупреждение о смене пароля
-    log_warn "⚠️  ВАЖНО: Смените пароль после первого входа!" # Предупреждение
-    echo ""                                                 # Пустая строка
-    
-    # Информация о Portainer
-    log_info "🐳 PORTAINER (СКРЫТЫЙ ДОСТУП):"               # Заголовок секции
-    echo "  Доступ только через SSH-туннель:"               # Пояснение
-    echo "  ssh -L ${PORTAINER_PORT}:localhost:${PORTAINER_PORT} root@${SERVER_IP}" # Команда туннеля
-    echo "  Затем откройте: http://localhost:${PORTAINER_PORT}" # Локальный URL
-    echo ""                                                 # Пустая строка
-    
-    # Информация о VLESS подключении
-    log_info "🔐 VLESS + REALITY ПАРАМЕТРЫ:"                # Заголовок секции
-    echo "  Порт: ${VLESS_PORT}"                            # Порт VLESS
-    echo "  UUID: $UUID"                                    # UUID клиента
-    echo "  Public Key: $REALITY_PUBLIC_KEY"                # Публичный ключ
-    echo "  Short ID: $REALITY_SHORT_ID"                    # Short ID
-    echo "  SNI: ${REALITY_SNI}"                            # SNI для маскировки
-    echo ""                                                 # Пустая строка
-    
-    # Полезные команды
-    log_info "📋 ПОЛЕЗНЫЕ КОМАНДЫ:"                         # Заголовок секции
-    echo "  docker compose ps              # Статус контейнеров" # Команда 1
-    echo "  docker compose logs -f         # Просмотр логов"     # Команда 2
-    echo "  docker compose restart         # Перезапуск"         # Команда 3
-    echo "  docker compose down            # Остановка"          # Команда 4
-    echo ""                                                 # Пустая строка
-    
-    log_info "============================================================" # Разделитель
-    echo ""                                                 # Пустая строка
-}
-
-# ==============================================================================
-# ОСНОВНАЯ ФУНКЦИЯ
-# ==============================================================================
-main() {                                                    # Объявление главной функции
-    log_info "============================================================" # Заголовок
-    log_info "🚀 НАЧАЛО УСТАНОВКИ VLESS + XHTTP + REALITY"    # Информационное сообщение
-    log_info "============================================================" # Разделитель
-    echo ""                                                 # Пустая строка
-    
-    check_requirements                                      # Шаг 1: Проверка требований
-    generate_config                                         # Шаг 2: Генерация конфигурации
-    setup_ip_forwarding                                     # Шаг 3: Включение IP-форвардинга (НОВОЕ!)
-    setup_firewall                                          # Шаг 4: Настройка firewall
-    setup_ssh_keys                                          # Шаг 5: Настройка SSH
-    install_fail2ban                                        # Шаг 6: Установка Fail2Ban
-    start_services                                          # Шаг 7: Запуск сервисов
-    show_info                                               # Шаг 8: Вывод информации
-    
-    log_info "✅ Установка завершена!"                      # Финальное сообщение
-}
-
-# ==============================================================================
-# ТОЧКА ВХОДА В СКРИПТ
-# ==============================================================================
-main "$@"                                                   # Вызов главной функции с передачей аргументов
+  # ============================================
+  # Portainer - Управление Docker (СКРЫТ)
+  # ============================================
+  portainer:
+    image: portainer/portainer-ce:latest
+    container_name: portainer
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9000:9000"
+    volumes:
+      - ./data/portainer:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: --admin-password '${PORTAINER_HASHED_PASSWORD}'
+    profiles:
+      - management

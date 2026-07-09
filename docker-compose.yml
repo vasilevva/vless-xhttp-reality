@@ -1,7 +1,6 @@
 services:
-
   # ============================================
-  # 3X-UI - Панель управления
+  # 3X-UI - Панель управления (Включает в себя Xray)
   # ============================================
   3x-ui:
     image: ghcr.io/mhsanaei/3x-ui:latest
@@ -23,46 +22,12 @@ services:
     cap_add:
       - NET_ADMIN
       - NET_RAW
-    # Healthcheck: проверяем, что панель отвечает на своём порту
     healthcheck:
-      # В образе 3x-ui есть curl, используем его
-      # Проверяем корень панели (не сложный путь, чтобы избежать проблем с подстановкой)
-      test: ["CMD-SHELL", "curl -fsSL http://localhost:${PANEL_PORT:-2053}/ || exit 1"]
-      interval: 30s          # Проверка каждые 30 секунд
-      timeout: 10s           # Таймаут ожидания ответа
-      retries: 3             # 3 неудачи = контейнер unhealthy
-      start_period: 60s      # Даём 60 секунд на первый запуск (панель инициализируется долго)
-
-  # ============================================
-  # Xray Core - Основной прокси-сервер
-  # ============================================
-  xray:
-    image: ghcr.io/xtls/xray-core:latest
-    container_name: xray
-    restart: unless-stopped
-    network_mode: host
-    volumes:
-      - ./data/xray:/etc/xray
-      - ./data/cert:/root/cert
-      - ./data/logs:/var/log/xray
-    cap_add:
-      - NET_ADMIN
-      - NET_RAW
-    environment:
-      - LOG_LEVEL=warning
-    depends_on:
-      3x-ui:
-        condition: service_started   # Ждём запуска 3x-ui (не ждём healthy, чтобы не блокировать)
-    # Healthcheck: проверяем, что Xray слушает порт 443
-    healthcheck:
-      # В образе xray-core есть wget, проверяем слушается ли порт
-      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:443 || exit 0"]
-      # Примечание: Xray с Reality не отвечает на обычные HTTP-запросы,
-      # поэтому используем "exit 0" — просто проверяем, что процесс жив
-      interval: 60s          # Проверка каждую минуту (Xray стабилен, частые проверки не нужны)
-      timeout: 5s            # Короткий таймаут
-      retries: 3             # 3 неудачи = unhealthy
-      start_period: 30s      # 30 секунд на запуск
+      test: ["CMD", "curl", "-f", "http://localhost:${PANEL_PORT}${PANEL_PATH}panel/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
 
   # ============================================
   # Watchtower - Автоматическое обновление
@@ -73,7 +38,7 @@ services:
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-    command: --cleanup --interval 604800 3x-ui xray
+    command: --cleanup --interval 604800 3x-ui
     environment:
       - WATCHTOWER_NOTIFICATIONS=auto
     profiles:
@@ -94,9 +59,3 @@ services:
     command: --admin-password '${PORTAINER_HASHED_PASSWORD}'
     profiles:
       - management
-    healthcheck:
-      test: ["CMD-SHELL", "wget -q --spider http://localhost:9000 || exit 1"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 30s
